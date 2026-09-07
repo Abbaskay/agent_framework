@@ -1,38 +1,61 @@
 """
 core/logger.py — Structured logging for the agent framework.
 
-Logs every LLM call, tool call, error, and agent completion to both
-console and a JSONL file for observability and debugging.
+Logs every LLM call, tool call, delegation, error, and completion to both
+console and a JSONL file.
+
+Every event carries run_id / agent / depth / parent, which is what makes a
+multi-agent run reconstructable: one `run_id` groups an entire delegation tree,
+and depth + parent recover its shape from a flat log file.
 """
 
 import json
 from datetime import datetime
 
+from core.context import RunContext
+
 
 class Logger:
     """Structured logger that writes events to console and a JSONL file."""
 
-    def __init__(self, log_file: str = "agent_logs.jsonl"):
-        """Initialize the logger with a target log file path."""
-        self.log_file = log_file
+    def __init__(self, log_file: str = "agent_logs.jsonl", echo: bool = True):
+        """Initialize the logger.
 
-    def log(self, event_type: str, data: dict) -> None:
+        Args:
+            log_file: Target JSONL path.
+            echo:     Print to console as well. Tests turn this off.
+        """
+        self.log_file = log_file
+        self.echo = echo
+
+    def log(self, event_type: str, data: dict, context: RunContext | None = None) -> None:
         """Write a structured log entry to file and print to console.
 
         Args:
             event_type: Category of event (e.g. 'llm_call', 'tool_call').
             data:       Key-value pairs describing the event.
+            context:    Run context, contributing run_id / depth / parent.
         """
         timestamp = datetime.now().isoformat()
         entry = {"timestamp": timestamp, "event": event_type, "data": data}
 
-        # Append as a single JSON line to the log file
-        with open(self.log_file, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        if context is not None:
+            entry["run_id"] = context.run_id
+            entry["depth"] = context.depth
+            entry["parent"] = context.parent
 
-        # Pretty-print to console for live observability
-        kv_str = " | ".join(f"{k}={v}" for k, v in data.items())
-        print(f"[{timestamp}] [{event_type.upper()}] {kv_str}")
+        try:
+            with open(self.log_file, "a") as f:
+                f.write(json.dumps(entry, default=str) + "\n")
+        except OSError:
+            # Logging must never take down an agent run.
+            pass
+
+        if self.echo:
+            # Indent nested agents so the console shows the tree shape live.
+            indent = "  " * (context.depth if context else 0)
+            kv_str = " | ".join(f"{k}={v}" for k, v in data.items())
+            print(f"{indent}[{timestamp}] [{event_type.upper()}] {kv_str}")
 
     def log_llm_call(
         self,
@@ -41,6 +64,7 @@ class Logger:
         iteration: int,
         stop_reason: str,
         input_tokens: int = 0,
+        context: RunContext | None = None,
     ) -> None:
         """Log an LLM API call."""
         self.log(
@@ -52,6 +76,7 @@ class Logger:
                 "stop_reason": stop_reason,
                 "input_tokens": input_tokens,
             },
+            context,
         )
 
     def log_tool_call(
@@ -60,6 +85,7 @@ class Logger:
         tool_name: str,
         tool_input: dict,
         tool_output: str,
+        context: RunContext | None = None,
     ) -> None:
         """Log a tool function execution. Output truncated to 200 chars."""
         self.log(
@@ -68,8 +94,27 @@ class Logger:
                 "agent": agent_name,
                 "tool": tool_name,
                 "input": tool_input,
-                "output": tool_output[:200],
+                "output": str(tool_output)[:200],
             },
+            context,
+        )
+
+    def log_delegation(
+        self,
+        agent_name: str,
+        target_agent: str,
+        task: str,
+        context: RunContext | None = None,
+    ) -> None:
+        """Log one agent handing a subtask to another."""
+        self.log(
+            "delegation",
+            {
+                "agent": agent_name,
+                "target": target_agent,
+                "task": task[:200],
+            },
+            context,
         )
 
     def log_error(
@@ -78,6 +123,7 @@ class Logger:
         error_type: str,
         message: str,
         iteration: int,
+        context: RunContext | None = None,
     ) -> None:
         """Log an error encountered during agent execution."""
         self.log(
@@ -88,6 +134,7 @@ class Logger:
                 "message": message,
                 "iteration": iteration,
             },
+            context,
         )
 
     def log_agent_complete(
@@ -95,6 +142,7 @@ class Logger:
         agent_name: str,
         iterations: int,
         total_tool_calls: int,
+        context: RunContext | None = None,
     ) -> None:
         """Log successful completion of an agent run."""
         self.log(
@@ -103,7 +151,9 @@ class Logger:
                 "agent": agent_name,
                 "iterations": iterations,
                 "total_tool_calls": total_tool_calls,
+                "budget_spent": context.budget.spent if context else None,
             },
+            context,
         )
 
 

@@ -1,62 +1,91 @@
 """
-main.py — CLI entry point for the Hyperzod Agent Framework.
+main.py — CLI entry point.
 
-Run agents in the terminal without the Streamlit UI.
+Run any registered agent in the terminal without the Streamlit UI.
 Useful for development, testing, and debugging.
+
+The agent menu is built from the AgentRegistry, so registering a new agent in
+`agents/` makes it appear here automatically.
 """
 
+import agents  # noqa: F401  (side-effect import — populates the registry)
+from core.context import RunContext
 from core.memory import Memory
+from core.registry import registry
 from core.runner import run_agent
-from configs.hyperzod import HYPERZOD_CONFIG
-from configs.standalone import STANDALONE_CONFIG, RESEARCH_CONFIG, ANALYST_CONFIG
 
 
-CONFIG_MAP = {
-    "hyperzod": HYPERZOD_CONFIG,
-    "standalone": STANDALONE_CONFIG,
-    "research": RESEARCH_CONFIG,
-    "analyst": ANALYST_CONFIG,
-}
+def print_trace(trace: list, indent: int = 1) -> None:
+    """Print a tool trace, recursing into delegations to show the tree."""
+    pad = "  " * indent
+    for step in trace:
+        if step.get("sub_trace") is not None:
+            print(f"{pad}└─ delegated to {step.get('agent_name')}")
+            print_trace(step["sub_trace"], indent + 1)
+        else:
+            print(f"{pad}• {step['tool']}({step['input']})")
 
 
 def main():
-    """Run the agent framework in CLI mode."""
-    print("=" * 60)
-    print("  🛵  Hyperzod Agent Framework — CLI Mode")
-    print("=" * 60)
-    print()
-    print("Available modes:")
-    for key, cfg in CONFIG_MAP.items():
-        print(f"  • {key:12s} — {cfg.description}")
-    print()
+    """Run the framework in CLI mode."""
+    print("=" * 64)
+    print("  Agent Framework — CLI")
+    print("=" * 64)
+    print("\nAvailable agents:")
 
-    # Select mode
-    mode = input("Choose mode (hyperzod/standalone/research/analyst): ").strip().lower()
-    if mode not in CONFIG_MAP:
-        print(f"Unknown mode '{mode}'. Defaulting to 'hyperzod'.")
-        mode = "hyperzod"
+    for config in registry.all():
+        marker = "◆" if config.is_orchestrator else "•"
+        print(f"  {marker} {config.name:22s} {config.description}")
+    print("\n  ◆ = orchestrator (can delegate to specialists)\n")
 
-    config = CONFIG_MAP[mode]
+    choice = input(f"Choose an agent [{registry.names()[0]}]: ").strip()
+    if not choice:
+        choice = registry.names()[0]
+    if not registry.has(choice):
+        print(f"Unknown agent '{choice}'. Falling back to '{registry.names()[0]}'.")
+        choice = registry.names()[0]
+
+    config = registry.get(choice)
     memory = Memory()
 
-    print(f"\n✅ Loaded: {config.name} ({config.description})")
-    print(f"   Model: {config.model} | Tools: {', '.join(config.tool_names)}")
-    print(f"   Type 'exit' or 'quit' to stop.\n")
+    print(f"\n✅ Loaded: {config.name}")
+    print(f"   Provider: {config.provider} | Model: {config.model}")
+    print(f"   Tools: {', '.join(config.tool_names) or 'none'}")
+    if config.is_orchestrator:
+        print(f"   Delegates to: {', '.join(config.delegates_to)}")
+    print("   Type 'exit' or 'quit' to stop.\n")
 
-    # Conversation loop
     while True:
-        user_input = input("You: ").strip()
+        try:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n👋 Goodbye!")
+            break
+
         if user_input.lower() in ("exit", "quit"):
             print("\n👋 Goodbye!")
             break
         if not user_input:
             continue
 
-        result = run_agent(user_input, config, memory)
+        # A fresh RunContext per turn: each user message gets its own run_id and
+        # its own budget, so one expensive turn doesn't starve the next.
+        result = run_agent(
+            task=user_input,
+            config=config,
+            memory=memory,
+            context=RunContext(),
+            registry=registry,
+        )
+
         print(f"\nAgent: {result['answer']}")
+        if result["trace"]:
+            print("\n  Trace:")
+            print_trace(result["trace"])
         print(
-            f"  [{result['tool_call_count']} tool(s) used "
-            f"in {result['iterations']} iteration(s)]\n"
+            f"\n  [{result['tool_call_count']} tool(s), "
+            f"{result['iterations']} iteration(s), "
+            f"status: {result['stop_reason']}]\n"
         )
 
 

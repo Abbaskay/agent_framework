@@ -1,128 +1,202 @@
-# 🛵 Hyperzod Agent Framework
+# 🧭 Agent Framework
 
-A production-grade, config-driven AI agent framework built with Python. Define an agent's identity, tools, and behavior in a single `AgentConfig` dataclass — the shared engine handles everything else. Powered by DeepSeek via the OpenAI-compatible API with full structured logging, exponential backoff retry, and a real-time thinking panel UI.
+A small, readable multi-agent framework in Python. An **orchestrator** decomposes a task, routes
+each subtask to a **specialist agent** from a registry, and composes the results — with a shared
+call budget, depth limits, per-agent tool allow-lists, and a structured trace of the whole tree.
+
+Define an agent's identity, tools, and delegation targets in one `AgentConfig`. The shared engine
+handles the rest.
+
+```
+                    ┌──────────────┐
+      user  ───────▶│ ORCHESTRATOR │───────▶  final answer
+                    └──────┬───────┘
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+        research      data_analyst   hyperzod
+       specialist                    support
+              │            │            │
+              └──────▶ results ◀────────┘
+```
+
+**Hub-and-spoke, deliberately.** Specialists report to the orchestrator and stop; they never message
+each other. A peer-to-peer mesh — where any agent can talk to any other — demos well once and then
+fails in predictable ways: agents ping-pong agreement, drift off-task, and run up unbounded cost with
+no single owner of the plan. Here exactly one agent owns the plan and the call graph is a tree.
 
 ## Architecture
 
-The framework has 5 layers:
-
 | Layer | Purpose | Files |
 |-------|---------|-------|
-| **Registries** | Central lookup for tools, schemas, and prompts | `registries/` |
-| **Configs** | Agent persona definitions (one dataclass each) | `configs/` |
-| **Core Engine** | Shared orchestration loop, memory, logging | `core/` |
-| **Tools** | Business logic functions the agent can call | `tools/` |
-| **UI** | Streamlit chat interface with thinking panel | `ui.py` |
+| **Core engine** | Agentic loop, delegation, memory, budgets, logging | `core/` |
+| **Providers** | Vendor adapters behind one interface | `core/provider.py` |
+| **Registries** | Tool functions, schemas, and prompts | `registries/` |
+| **Agents** | Persona definitions (one `AgentConfig` each) | `agents/` |
+| **Tools** | Functions the agents can call | `tools/` |
+| **UI** | Streamlit chat with a nested thinking panel | `ui.py` |
 
 ```
-User message → ui.py (Streamlit) → core/runner.py (shared engine)
-→ DeepSeek API (reasoning + tool selection) → tools/ (functions) → data/ (mock data)
-→ response back up the chain → displayed in UI + logged to agent_logs.jsonl
+user message → ui.py → core/runner.py (shared engine)
+    → provider (DeepSeek / OpenAI / Anthropic)
+    → tools/  ─── or ───  core/orchestrator.py → run_agent(specialist) ─┐
+    ◀────────────────── result + nested trace ◀─────────────────────────┘
 ```
+
+Delegation is **not** a special path through the engine. `run_agent()` takes a config and returns a
+dict, so "delegate to a specialist" is just a synthesized tool whose implementation calls
+`run_agent()` with a different config. An orchestrator is an ordinary agent that happens to have a
+non-empty `delegates_to`.
 
 ## Setup
 
 ```bash
-# 1. Install dependencies
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Configure API key
-cp .env.example .env
-# Edit .env and add your DeepSeek API key from https://platform.deepseek.com/
+cp .env.example .env      # then add a key for whichever provider you use
 ```
 
 ## Run
 
-**Streamlit UI** (recommended):
 ```bash
-streamlit run ui.py
+streamlit run ui.py       # chat UI with the thinking panel
+python main.py            # CLI
+pytest -q                 # 55 tests, no network or API key needed
 ```
 
-**CLI mode** (for development/testing):
-```bash
-python main.py
+## Agents
+
+| Agent | Tools | Role |
+|-------|-------|------|
+| `orchestrator` ◆ | `get_current_time` + `delegate` | Decomposes and routes multi-part requests |
+| `research_specialist` | `search_web`, `get_current_time` | Finds and summarizes information |
+| `data_analyst` | `calculate`, `get_current_time` | Computes and explains results |
+| `standalone_assistant` | all general tools | General-purpose single agent |
+| `hyperzod_support` | 4 order tools | Example application pack (see below) |
+
+Try the orchestrator with something that genuinely needs two specialists:
+
+> *"Research the quick commerce market in India, then calculate the CAGR if it grew from 5000 crore
+> to 12000 crore over 3 years."*
+
+You'll see it delegate to `research_specialist`, then to `data_analyst`, then synthesize one answer.
+
+## Adding an agent
+
+One file, one `AgentConfig`:
+
+```python
+# agents/my_agent.py
+from core.config import AgentConfig
+
+WRITER_CONFIG = AgentConfig(
+    name="writer",
+    prompt_key="writer",              # a key in registries/prompt_registry.py
+    tool_names=["search_web"],
+    description="Drafts prose from research notes",
+)
 ```
 
-## Agent Modes
+Add it to the list in `agents/__init__.py`. The CLI menu, the UI dropdown, and any orchestrator's
+delegation targets all update from that one edit.
 
-| Mode | Tools | Use Case | Config File |
-|------|-------|----------|-------------|
-| Hyperzod Support | get_order_status, get_eta, request_refund, escalate_to_human | Customer order support | `configs/hyperzod.py` |
-| Standalone Assistant | search_web, calculate, get_current_time | General-purpose helper | `configs/standalone.py` |
-| Research Specialist | search_web, get_current_time | Information gathering | `configs/standalone.py` |
-| Data Analyst | calculate, get_current_time | Number crunching | `configs/standalone.py` |
+## Adding a tool
 
-## Adding a New Agent (3 Steps)
+One decorated function. The JSON schema is derived from the signature, so it cannot drift from the
+implementation:
 
-The framework's core value — adding a new agent requires changes in **exactly 3 places**:
+```python
+from typing import Annotated
+from registries.tool_registry import tool
 
-### Step 1: Add tool functions
-Create or add functions in `tools/` and register them in `registries/tool_registry.py` and `registries/schema_registry.py`.
+@tool(description="Look up a customer's loyalty tier.")
+def get_loyalty_tier(
+    customer_id: Annotated[str, "The customer ID, e.g. 'C-1024'."],
+) -> str:
+    """Look up a customer's loyalty tier."""
+    return f"{customer_id}: Gold"
+```
 
-### Step 2: Add a system prompt
-Add a new entry in `registries/prompt_registry.py` with a unique key.
+## Swapping providers
 
-### Step 3: Add an AgentConfig
-Create a new `AgentConfig` in `configs/` referencing the prompt key and tool names.
+`AgentConfig.provider` selects the backend; the engine never imports a vendor SDK directly.
 
-That's it — the runner, UI, and logging all work automatically.
+```python
+AgentConfig(name="...", provider="anthropic", model="claude-sonnet-5", ...)
+```
 
-## Demo Queries
+Built in: `deepseek`, `openai`, `anthropic`. Adding one means a class with a `complete()` method and
+an entry in `PROVIDER_FACTORIES` — adapters translate message formats and normalize responses, and
+hold no orchestration logic.
 
-### Hyperzod Support
-- `"Where is my order HZ001?"`
-- `"I want a refund for order HZ002, the food was cold"`
-- `"My order HZ005 has been stuck for hours, this is unacceptable"`
+## What keeps it bounded
 
-### Standalone Assistant
-- `"Search for the latest trends in AI"`
-- `"What is 15% of 890?"`
-- `"What time is it right now?"`
+Multi-agent systems fail by running away. Four limits, all enforced in the engine:
 
-### Research Specialist
-- `"Research the history of quick commerce in India"`
-- `"Find information about last-mile delivery optimization"`
-- `"What are the latest developments in LLM agents?"`
+- **Tool allow-list** — enforced at *execution*, against `config.tool_names`. Restricting the schema
+  list only shapes what the model is offered; a model can still name a tool it was never shown. Without
+  the execution check, a research agent could invoke `request_refund`.
+- **Shared budget** — one `Budget` object is passed *by reference* through the entire tree, so the
+  ceiling is on total LLM calls per run, not per agent. Pass-by-value would hand each subagent a fresh
+  allowance and defeat the cap.
+- **Depth limit** — at the ceiling an orchestrator keeps its own tools but loses `delegate`, which is
+  what terminates the recursion.
+- **Bounded memory** — oldest-first trimming that always keeps the originating task and never leaves
+  an orphaned tool result at the window start.
 
-### Data Analyst
-- `"Calculate the compound interest on 50000 at 8% for 3 years"`
-- `"What is (1200 * 12) - (350 * 12)?"`
-- `"If I save 5000 per month for 2 years, how much do I have?"`
+Every run gets a `run_id` shared by every agent in its tree; each log line carries `depth` and
+`parent`, so a flat `agent_logs.jsonl` reconstructs the tree.
 
-## Project Structure
+## Tests
+
+```bash
+pytest -q     # 55 tests
+```
+
+A `FakeProvider` (`tests/fakes.py`) returns scripted responses, so the whole engine — loop,
+allow-list, delegation, budgets, memory trimming — is tested with no network and no API key. The
+`routes` mode keys scripts by system prompt, which lets one fake serve an entire delegation tree.
+
+## A note on the tools
+
+`search_web` performs **real** searches (DuckDuckGo by default, no key required; Tavily when
+`TAVILY_API_KEY` is set). `calculate` is a real AST-based arithmetic evaluator — deliberately not
+`eval`, since `eval` with `{"__builtins__": {}}` is escapable via object internals.
+
+The four `hyperzod_*` tools are **fixtures**: they read from an in-memory dict of seven orders in
+`data/mock_data.py`, and refund state resets when the process restarts. They exist to give the
+framework a realistic multi-tool domain to demonstrate routing against — there is no backend behind
+them. `agents/hyperzod.py` is an example application pack; delete it and the framework still runs.
+
+## Project structure
 
 ```
 ├── core/
-│   ├── __init__.py            # Core package
-│   ├── runner.py              # Shared agent orchestration engine
-│   ├── config.py              # AgentConfig dataclass
-│   ├── memory.py              # In-memory conversation manager
-│   └── logger.py              # Structured JSONL logging
+│   ├── runner.py          # Shared agent engine (the agentic loop)
+│   ├── orchestrator.py    # Delegation as a synthesized tool
+│   ├── provider.py        # Provider protocol + DeepSeek/OpenAI/Anthropic adapters
+│   ├── registry.py        # AgentRegistry
+│   ├── context.py         # RunContext + shared Budget
+│   ├── config.py          # AgentConfig dataclass
+│   ├── memory.py          # Bounded conversation history
+│   └── logger.py          # Structured JSONL logging with run_id/depth/parent
 ├── registries/
-│   ├── __init__.py            # Registries package
-│   ├── tool_registry.py       # Tool name → function mapping
-│   ├── schema_registry.py     # Tool name → JSON schema mapping
-│   └── prompt_registry.py     # Prompt key → system prompt mapping
+│   ├── tool_registry.py   # @tool decorator + schema derivation
+│   ├── schema_registry.py # Re-export shim (schemas are now derived)
+│   └── prompt_registry.py # System prompts by key
+├── agents/
+│   ├── orchestrator.py    # The coordinator
+│   ├── general.py         # Research, analyst, standalone
+│   └── hyperzod.py        # Example application pack
 ├── tools/
-│   ├── __init__.py            # Tools package
-│   ├── hyperzod_tools.py      # 4 order support tools
-│   └── general_tools.py       # 3 general-purpose tools
-├── data/
-│   └── mock_data.py           # Simulated order database (7 orders)
-├── configs/
-│   ├── __init__.py            # Configs package
-│   ├── hyperzod.py            # Hyperzod support config
-│   └── standalone.py          # Standalone, research, analyst configs
-├── ui.py                      # Streamlit UI with thinking panel
-├── main.py                    # CLI entry point
-├── requirements.txt           # Python dependencies
-├── .env.example               # API key template
-└── README.md                  # This file
+│   ├── general_tools.py   # search_web, calculate, get_current_time
+│   └── hyperzod_tools.py  # 4 order-support fixtures
+├── data/mock_data.py      # Fixture order database
+├── tests/                 # 55 tests + FakeProvider
+├── ui.py                  # Streamlit UI
+└── main.py                # CLI
 ```
 
-## Tech Stack
+## Tech stack
 
-- **Python 3.10+**
-- **OpenAI SDK** — DeepSeek (`deepseek-chat`) via OpenAI-compatible API
-- **Streamlit** — Two-column chat UI with session state
-- **python-dotenv** — Secure API key management
+Python 3.10+ · OpenAI & Anthropic SDKs · Streamlit · pytest · ddgs

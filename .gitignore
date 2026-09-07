@@ -1,0 +1,16 @@
+# Environments
+venv/
+.venv/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime artifacts
+agent_logs.jsonl
+
+# OS / editor
+.DS_Store
+.vscode/
